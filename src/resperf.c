@@ -401,7 +401,7 @@ static void setup(int argc, char** argv)
     if (!(queries = calloc(max_outstanding, sizeof(query_info)))) {
         perf_log_fatal("out of memory");
     }
-    if (ramp_clients && !(idx_hash = calloc(nsocks * MAX_QID, sizeof(size_t)))) {
+    if (ramp_clients && !(idx_lookup = calloc(nsocks * MAX_QID, sizeof(size_t)))) {
         perf_log_fatal("out of memory for ramp_clients");
     }
     for (i = 0; i < max_outstanding; i++) {
@@ -600,11 +600,11 @@ client_ramp_get_qid(unsigned int idx, unsigned int sock)
 {
     unsigned int qid=0;
 
-    qid = ++idx_hash[sock*MAX_QID];
+    qid = ++idx_lookup[sock*MAX_QID];
     if(qid > MAX_QID) {
         qid = idx_lookup[sock*MAX_QID]=1;
     }
-    idx_hash[sock * MAX_QID + qid] = idx + 1;
+    idx_lookup[sock * MAX_QID + qid] = idx + 1;
 
     return qid;
 }
