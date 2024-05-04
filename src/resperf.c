@@ -205,6 +205,9 @@ static perf_tsigkey_t* tsigkey;
 
 static bool         verbose;
 static unsigned int max_fall_behind;
+static bool         ramp_clients;
+static size_t*      idx_lookup;  
+#define MAX_QID 0xffff
 
 static perf_suppress_t suppress;
 
@@ -345,6 +348,7 @@ static void setup(int argc, char** argv)
         "suppress messages/warnings, see dnsperf(1) man-page for list of message types", NULL, &local_suppress);
     perf_long_opt_add("num-queries-per-conn", perf_opt_uint, "queries",
         "Number of queries to send per connection", NULL, &num_queries_per_conn);
+    perf_long_opt_add("ramp_clients_too", perf_opt_boolean, NULL, "Ramp usage of clients over time as query rate rises", NULL, &ramp_clients);
 
     perf_opt_parse(argc, argv);
 
@@ -396,6 +400,9 @@ static void setup(int argc, char** argv)
     perf_list_init(instanding_list);
     if (!(queries = calloc(max_outstanding, sizeof(query_info)))) {
         perf_log_fatal("out of memory");
+    }
+    if (ramp_clients && !(idx_hash = calloc(nsocks * MAX_QID, sizeof(size_t)))) {
+        perf_log_fatal("out of memory for ramp_clients");
     }
     for (i = 0; i < max_outstanding; i++) {
         perf_link_init(&queries[i]);
@@ -577,6 +584,31 @@ print_statistics(void)
         PERF_SAFE_DIV(100.0 * num_conn_completed, num_conn_attempts));
 }
 
+static inline int
+clients_scheduled(uint64_t time_since_start)
+{
+    if (ramp_clients && phase == PHASE_RAMP) {
+        int rsocks=nsocks * (double)( time_since_start ) / ( ramp_time );
+         return rsocks<1 ? 1 : rsocks;
+    } else { /* PHASE_SUSTAIN */
+        return nsocks;
+    }
+}
+
+static inline unsigned int
+client_ramp_get_qid(unsigned int idx, unsigned int sock)
+{
+    unsigned int qid=0;
+
+    qid = ++idx_hash[sock*MAX_QID];
+    if(qid > MAX_QID) {
+        qid = idx_lookup[sock*MAX_QID]=1;
+    }
+    idx_hash[sock * MAX_QID + qid] = idx + 1;
+
+    return qid;
+}
+
 /*
  * Send a query based on a line of input.
  * Return PERF_R_NOMORE if we ran out of query IDs.
@@ -595,8 +627,14 @@ do_one_line(perf_buffer_t* lines, perf_buffer_t* msg)
     q = perf_list_head(instanding_list);
     if (!q)
         return (PERF_R_NOMORE);
-    qid  = (q - queries) / nsocks;
-    sock = (q - queries) % nsocks;
+
+    if(ramp_clients) {
+        sock = (q - queries) % clients_scheduled(time_now - time_of_program_start); 
+        qid  = client_ramp_get_qid(q - queries, sock);
+    } else {
+        qid  = (q - queries) / nsocks;
+        sock = (q - queries) % nsocks;
+    }
 
     while (q->is_inprogress) {
         if (perf_net_sockready(socks[sock], dummypipe[0], TIMEOUT_CHECK_TIME) == -1) {
@@ -624,8 +662,13 @@ do_one_line(perf_buffer_t* lines, perf_buffer_t* msg)
         q = perf_list_head(instanding_list);
         if (!q)
             return (PERF_R_NOMORE);
-        qid  = (q - queries) / nsocks;
-        sock = (q - queries) % nsocks;
+        if(ramp_clients) {
+            sock = (q - queries) % clients_scheduled(time_now - time_of_program_start);
+            qid  = client_ramp_get_qid(q - queries, sock);
+        } else {
+            qid  = (q - queries) / nsocks;
+            sock = (q - queries) % nsocks;
+        }
     }
 
     switch (perf_net_sockready(socks[sock], dummypipe[0], TIMEOUT_CHECK_TIME)) {
@@ -756,7 +799,18 @@ try_process_response(unsigned int sockindex)
     qid   = ntohs(packet_header[0]);
     rcode = ntohs(packet_header[1]) & 0xF;
 
-    size_t idx = qid * nsocks + sockindex;
+    size_t idx;
+    if(ramp_clients) {
+        idx = idx_lookup[sockindex * MAX_QID + qid];
+        if (idx==0) {
+            idx=max_outstanding+1;
+        } else {
+            idx-=1;
+        }
+    } else {
+        idx = qid * nsocks + sockindex;
+    }
+
     if (idx >= max_outstanding || queries[idx].list != &outstanding_list) {
         if (!suppress.unexpected) {
             perf_log_warning("received a response with an unexpected id: %u", qid);
